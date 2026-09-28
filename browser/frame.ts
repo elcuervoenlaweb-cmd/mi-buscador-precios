@@ -1,0 +1,1763 @@
+/**
+ * The program that runs inside a browsed page, on the other side of the
+ * isolation boundary.
+ *
+ * This file is never imported by the app. `scripts/build-browser-frame.mjs`
+ * bundles it into a single string, and `src/browser/engine.ts` writes that
+ * string into the top of every document it hands a tab — so what follows
+ * executes with an opaque origin, inside a sandboxed frame, in the same realm
+ * as a stranger's JavaScript and with no way back to the harness except one
+ * `postMessage` channel.
+ *
+ * Two jobs, and they are separate.
+ *
+ * **Be the browser the page thinks it is in.** An opaque origin is a hostile
+ * place to be a website: `localStorage`, `sessionStorage`, `document.cookie`,
+ * `indexedDB` and `caches` all throw `SecurityError` rather than working, and
+ * `fetch` reaches nothing at all. Every one of those is replaced here with
+ * something that does work — backed by a jar the page owns, or by a request
+ * the page makes on the frame's behalf. A site should be unable to tell the
+ * difference until it tries to log in.
+ *
+ * **Be the machine the agent drives.** The three modes the tools offer — the
+ * DOM, the pixels, and the console — are three views of this one document, and
+ * all three are implemented below: {@link snapshot} walks the page the way a
+ * screen reader would, {@link rasterise} draws it into a canvas and reads the
+ * pixels back, and `evaluate` is the console. They are in one file because
+ * they are one thing: a page, seen three ways.
+ *
+ * ## What may be trusted here
+ *
+ * Nothing in this file defends the harness. It cannot: it shares a realm with
+ * the page, so a page determined to break these shims will break them. The
+ * defence is one level up and belongs to the browser — the frame has an opaque
+ * origin, so `parent.document` is a `SecurityError`, the harness's storage is
+ * unreachable, and the worst a page can do is lie to the agent about itself.
+ * Every message this file sends is treated by `src/browser/engine.ts` as
+ * hostile input, and that is the right place for that check.
+ */
+
+import * as locate from './frame-locate.ts'
+import { bounded } from './protocol.ts'
+
+/** What the page injects ahead of this bundle. */
+interface FrameInit {
+  /** Identifies this tab to the page; every message carries it. */
+  nonce: string
+  /** The document's real URL, which `location` must report. */
+  url: string
+  /** The cookies that apply to it, as a `document.cookie` string. */
+  cookie: string
+  /** This origin's `localStorage`, as the profile holds it. */
+  local: Record<string, string>
+  /** This tab's `sessionStorage`, which dies with the tab. */
+  session: Record<string, string>
+  /** What `navigator.userAgent` should say. */
+  userAgent: string
+  /**
+   * Which nested frame this document is, when it is one.
+   *
+   * The top document of a tab has none. A frame inside it gets a token from
+   * `src/browser/rewrite.ts`, written both here and onto the `<iframe>` element
+   * that holds it — which is what lets a locator that has walked into a frame
+   * be routed to the runtime that can resolve it. Each nested document is its
+   * own opaque origin, so the parent cannot reach into it and the token is the
+   * only correspondence there is.
+   */
+  frame?: string
+  /**
+   * How many windows up the machine is.
+   *
+   * The tab's own document is one hop from it; a nested frame is one more,
+   * because a browsed document sits in between. The machine supplies the
+   * number rather than this guessing at `top`: `top` is the machine only when
+   * the harness is not itself embedded, and where it is, `top` is a stranger's
+   * document — which would receive every snapshot, every request body and this
+   * document's own nonce, while the machine received nothing.
+   */
+  hops?: number
+}
+
+declare global {
+  interface Window {
+    __WB_INIT__?: FrameInit
+    __wbRuntime?: unknown
+  }
+}
+
+const init: FrameInit = window.__WB_INIT__ ?? {
+  nonce: '', url: 'about:blank', cookie: '', local: {}, session: {}, userAgent: navigator.userAgent,
+}
+
+/** Messages waiting for the page to be listening. */
+const outbox: unknown[] = []
+
+/**
+ * The window the machine listens in.
+ *
+ * Up rather than sideways: a frame three levels down still belongs to the
+ * machine, and a chain of relays through documents that cannot read each
+ * other's messages would be one hop of forwarding code per level, each of them
+ * able to drop or forge what it passes on. The window above is reachable
+ * cross-origin, `postMessage` on it is allowed, and the page checks the sender
+ * against the windows it knows.
+ * @returns the window every message from this document goes to.
+ */
+function machineWindow(): Window {
+  // Counted, not guessed. The tab's own document is one hop up; a nested frame
+  // is however many the machine said when it built this document. `top` would
+  // be wrong exactly when this app is itself embedded — see {@link
+  // FrameInit.hops}.
+  let current: Window = window
+  const hops = bounded(init.hops, 1, 1, 8)
+  for (let step = 0; step < hops; step += 1) {
+    const next: Window = current.parent
+    if (next === current) break
+    current = next
+  }
+  return current
+}
+
+/**
+ * Post one message to the machine, queueing it if the channel is not up yet.
+ * @param message - what to say; the nonce and this document's frame token are
+ * added here so no caller has to remember them.
+ */
+function send(message: Record<string, unknown>): void {
+  const envelope = {
+    ...message,
+    nonce: init.nonce,
+    ...(init.frame === undefined ? {} : { frame: init.frame }),
+    wb: true,
+  }
+  try {
+    machineWindow().postMessage(envelope, '*')
+  } catch {
+    outbox.push(envelope)
+  }
+}
+
+/** Requests waiting on the page, by id. */
+const pending = new Map<string, { resolve: (value: unknown) => void, reject: (error: Error) => void }>()
+
+let nextId = 0
+
+/**
+ * Ask the page for something and wait for the answer.
+ * @param kind - what is being asked.
+ * @param payload - the request.
+ * @returns whatever the page sent back.
+ */
+function ask(kind: string, payload: Record<string, unknown> = {}): Promise<unknown> {
+  const id = `r${String(nextId++)}`
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject })
+    send({ type: 'ask', id, kind, payload })
+  })
+}
+
+// ---------------------------------------------------------------------------
+// location
+// ---------------------------------------------------------------------------
+
+/**
+ * The URL this document reports, which is not the one it was loaded from.
+ *
+ * A sandboxed `srcdoc` frame's real `location.href` is `about:srcdoc`, and
+ * `window.location` cannot be redefined — it is the one property on `window`
+ * that `Object.defineProperty` refuses, which is why `src/browser/rewrite.ts`
+ * parses JavaScript at all. Every rewritten reference to `location` lands
+ * here instead.
+ */
+let current = new URL(init.url)
+
+/** Parts of a `URL` a `Location` also has, forwarded rather than reimplemented. */
+const LOCATION_PARTS = ['href', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'origin'] as const
+
+/** A `Location` that navigates through the page. */
+const virtualLocation = (() => {
+  const target: Record<string, unknown> = {
+    assign: (url: string) => { navigate(String(url), 'push') },
+    replace: (url: string) => { navigate(String(url), 'replace') },
+    reload: () => { void ask('reload') },
+    toString: () => current.href,
+    valueOf: () => current.href,
+    // A page comparing `location.ancestorOrigins.length` should see a top-level
+    // document, because as far as it can tell it is one.
+    ancestorOrigins: { length: 0, item: () => null, contains: () => false },
+  }
+  for (const part of LOCATION_PARTS) {
+    Object.defineProperty(target, part, {
+      enumerable: true,
+      configurable: true,
+      get: () => current[part],
+      set: (value: string) => {
+        // Assigning any part of a location is a navigation, and the browser
+        // resolves it against the current URL first — `location.pathname = '/x'`
+        // keeps the host.
+        const next = new URL(current.href)
+        if (part === 'href') { navigate(String(value), 'push'); return }
+        try {
+          ;(next as unknown as Record<string, unknown>)[part] = value
+        } catch {
+          return
+        }
+        navigate(next.href, 'push')
+      },
+    })
+  }
+  return target
+})()
+
+/**
+ * Go somewhere, by asking the page to fetch it.
+ * @param url - where to, relative to the current document.
+ * @param mode - whether this adds a history entry.
+ */
+function navigate(url: string, mode: 'push' | 'replace'): void {
+  let resolved: string
+  try {
+    resolved = new URL(url, current.href).href
+  } catch {
+    return
+  }
+  if (resolved.startsWith('javascript:')) return
+  send({ type: 'navigate', url: resolved, mode })
+}
+
+/** The runtime object every rewritten expression reads. */
+const runtime: Record<string, unknown> = {
+  // `top` and `parent` are this window. A page that checks whether it is
+  // framed concludes that it is not, which stops the frame-busting redirect
+  // every large site ships — and that redirect would otherwise be the first
+  // thing that happens on the page.
+  top: window,
+  parent: window,
+  self: window,
+  /**
+   * Dynamic `import()`, which cannot resolve a specifier from a `srcdoc`
+   * document because there is no base URL for it to resolve against.
+   * @param specifier - the module to load.
+   * @returns the module namespace.
+   */
+  import: async (specifier: string): Promise<unknown> => {
+    const url = await ask('module', { specifier: String(specifier), base: current.href })
+    return import(/* @vite-ignore */ String(url))
+  },
+}
+Object.defineProperty(runtime, 'location', {
+  enumerable: true,
+  get: () => virtualLocation,
+  set: (value: unknown) => { navigate(String(value), 'push') },
+})
+window.__wbRuntime = runtime
+
+// ---------------------------------------------------------------------------
+// storage
+// ---------------------------------------------------------------------------
+
+/**
+ * A `Storage` over a plain map, with the index access sites rely on.
+ *
+ * `localStorage.foo = 'x'` and `localStorage.foo` are part of the interface,
+ * not a convenience — enough sites use them that a shim implementing only the
+ * methods reads as an empty store. A `Proxy` is what makes both spellings hit
+ * the same map.
+ * @param entries - the initial contents.
+ * @param changed - called after every write, to push it to the page.
+ * @returns the storage object.
+ */
+function makeStorage(entries: Record<string, string>, changed: (key: string | null, value: string | null) => void): Storage {
+  const map = new Map<string, string>(Object.entries(entries))
+  const api: Record<string, unknown> = {
+    getItem: (key: unknown) => map.get(String(key)) ?? null,
+    setItem: (key: unknown, value: unknown) => {
+      map.set(String(key), String(value))
+      changed(String(key), String(value))
+    },
+    removeItem: (key: unknown) => {
+      map.delete(String(key))
+      changed(String(key), null)
+    },
+    clear: () => {
+      map.clear()
+      changed(null, null)
+    },
+    key: (index: unknown) => [...map.keys()][Number(index)] ?? null,
+  }
+  // Configurable, so that the proxy below may leave it out of `ownKeys`: the
+  // invariant is that every *non-configurable* own property of the target is
+  // listed, and without this `Object.keys(localStorage)`, `{...localStorage}`,
+  // `JSON.stringify(localStorage)` and `for (const k in localStorage)` all
+  // threw `TypeError: 'ownKeys' on proxy: trap result did not include
+  // 'length'` — on the shim a site falls back to when `indexedDB` is missing.
+  Object.defineProperty(api, 'length', { get: () => map.size, configurable: true })
+  return new Proxy(api, {
+    get: (base, property) => {
+      if (typeof property !== 'string' || property in base) return Reflect.get(base, property)
+      return map.get(property)
+    },
+    set: (base, property, value) => {
+      if (typeof property !== 'string' || property in base) return Reflect.set(base, property, value)
+      map.set(property, String(value))
+      changed(property, String(value))
+      return true
+    },
+    has: (base, property) => (typeof property === 'string' && map.has(property)) || property in base,
+    deleteProperty: (base, property) => {
+      if (typeof property === 'string') {
+        map.delete(property)
+        changed(property, null)
+      }
+      return Reflect.deleteProperty(base, property)
+    },
+    ownKeys: () => [...map.keys()],
+    getOwnPropertyDescriptor: (_base, property) => (typeof property === 'string' && map.has(property)
+      ? { value: map.get(property), enumerable: true, configurable: true, writable: true }
+      : undefined),
+  }) as unknown as Storage
+}
+
+/**
+ * Replace a global that throws with one that works.
+ * @param name - the property on `window`.
+ * @param value - what to put there.
+ */
+function define(name: string, value: unknown): void {
+  try {
+    Object.defineProperty(window, name, { configurable: true, writable: true, value })
+  } catch {
+    // A browser that will not let this be replaced leaves the throwing
+    // original, which is the behaviour without this file at all.
+  }
+}
+
+define('localStorage', makeStorage(init.local, (key, value) => {
+  send({ type: 'storage', area: 'local', key, value })
+}))
+define('sessionStorage', makeStorage(init.session, (key, value) => {
+  send({ type: 'storage', area: 'session', key, value })
+}))
+
+/**
+ * `indexedDB` and `caches`, which are removed rather than faked.
+ *
+ * Both throw `SecurityError` in an opaque origin, and neither can be shimmed
+ * in less than a database. Removing them is the honest option and the one
+ * sites handle: a feature test that fails sends the site down its
+ * `localStorage` path, which does work here. A stub that accepted `open()` and
+ * then never fired an event would hang the page instead, waiting for a
+ * transaction that was never going to complete.
+ */
+for (const name of ['indexedDB', 'caches', 'webkitIndexedDB', 'mozIndexedDB']) {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+    delete (window as unknown as Record<string, unknown>)[name]
+  } catch {
+    define(name, undefined)
+  }
+}
+
+/** The cookie jar, as the page handed it over and as script changes it. */
+let cookieText = init.cookie
+
+try {
+  Object.defineProperty(Document.prototype, 'cookie', {
+    configurable: true,
+    get: () => cookieText,
+    set: (value: string) => {
+      const text = String(value)
+      // The jar on the page's side decides what is actually stored — domains,
+      // paths and expiry are its rules to enforce — and reports the string
+      // this document should now read. Until it answers, the optimistic
+      // update is what a synchronous `document.cookie` read has to return.
+      const name = text.split(';')[0]?.split('=')[0]?.trim() ?? ''
+      const pair = text.split(';')[0]?.trim() ?? ''
+      const kept = cookieText.split('; ').filter((entry) => entry !== '' && entry.split('=')[0] !== name)
+      if (!/(?:^|;)\s*(?:max-age\s*=\s*-|expires\s*=)/i.test(text) || !/max-age\s*=\s*(?:0|-)/i.test(text)) {
+        kept.push(pair)
+      }
+      cookieText = kept.join('; ')
+      send({ type: 'cookie', value: text })
+    },
+  })
+} catch {
+  // Same reasoning as `define`: a browser that refuses leaves the throwing one.
+}
+
+// ---------------------------------------------------------------------------
+// network
+// ---------------------------------------------------------------------------
+
+/** One request the page made on the frame's behalf, as it comes back. */
+interface FetchReply {
+  status: number
+  statusText: string
+  headers: Record<string, string>
+  body: string
+  url: string
+  error?: string
+}
+
+const nativeFetch = window.fetch.bind(window)
+
+/**
+ * `fetch`, routed through the page.
+ *
+ * A `data:` or `blob:` URL is served by the frame itself, because those are
+ * the two schemes an opaque origin can read and because every subresource this
+ * machine inlines is one of them — sending them to the page would be a round
+ * trip to fetch bytes the frame already holds.
+ */
+define('fetch', async (input: RequestInfo | URL, config?: RequestInit): Promise<Response> => {
+  const request = new Request(typeof input === 'string' ? new URL(input, current.href).href : input, config)
+  if (/^(?:data|blob):/i.test(request.url)) return nativeFetch(request)
+  const body = config?.body === undefined || config.body === null ? undefined : String(config.body)
+  const reply = await ask('fetch', {
+    url: request.url,
+    method: request.method,
+    headers: Object.fromEntries(request.headers.entries()),
+    ...(body === undefined ? {} : { body }),
+  }) as FetchReply
+  if (reply.error !== undefined) throw new TypeError(reply.error)
+  const bytes = locate.fromBase64(reply.body)
+  const response = new Response(reply.status === 204 || reply.status === 304 ? null : bytes, {
+    status: reply.status,
+    statusText: reply.statusText,
+    headers: reply.headers,
+  })
+  Object.defineProperty(response, 'url', { value: reply.url })
+  return response
+})
+
+/**
+ * `XMLHttpRequest`, over the same channel.
+ *
+ * Enough of the interface for the libraries that still use it: the four
+ * lifecycle states, the events, the response accessors, and the header
+ * methods. Synchronous requests are not supported and say so — there is no way
+ * to block on a `postMessage` round trip, and a silent asynchronous answer to
+ * a synchronous call is worse than an error.
+ */
+class ProxiedXhr extends EventTarget {
+  static readonly UNSENT = 0
+  static readonly OPENED = 1
+  static readonly HEADERS_RECEIVED = 2
+  static readonly LOADING = 3
+  static readonly DONE = 4
+
+  readonly UNSENT = 0
+  readonly OPENED = 1
+  readonly HEADERS_RECEIVED = 2
+  readonly LOADING = 3
+  readonly DONE = 4
+
+  readyState = 0
+  status = 0
+  statusText = ''
+  responseText = ''
+  responseType: XMLHttpRequestResponseType = ''
+  responseURL = ''
+  timeout = 0
+  withCredentials = false
+  onreadystatechange: ((this: ProxiedXhr, event: Event) => unknown) | null = null
+  onload: ((this: ProxiedXhr, event: Event) => unknown) | null = null
+  onerror: ((this: ProxiedXhr, event: Event) => unknown) | null = null
+  onloadend: ((this: ProxiedXhr, event: Event) => unknown) | null = null
+  onprogress: ((this: ProxiedXhr, event: Event) => unknown) | null = null
+
+  #method = 'GET'
+  #url = ''
+  #headers: Record<string, string> = {}
+  #responseHeaders: Record<string, string> = {}
+  #bytes: Uint8Array<ArrayBuffer> = new Uint8Array(new ArrayBuffer(0))
+  #aborted = false
+
+  /** Whatever `responseType` asks for, built from the bytes that arrived. */
+  get response(): unknown {
+    if (this.responseType === 'json') {
+      try {
+        return JSON.parse(this.responseText)
+      } catch {
+        return null
+      }
+    }
+    if (this.responseType === 'arraybuffer') return this.#bytes.buffer
+    if (this.responseType === 'blob') return new Blob([this.#bytes])
+    if (this.responseType === 'document') {
+      return new DOMParser().parseFromString(this.responseText, 'text/html')
+    }
+    return this.responseText
+  }
+
+  /**
+   * Begin a request.
+   * @param method - the HTTP method.
+   * @param url - where to, relative to the document.
+   * @param async_ - must be true; a synchronous request cannot be served here.
+   */
+  open(method: string, url: string, async_ = true): void {
+    if (!async_) throw new DOMException('synchronous XMLHttpRequest is not available in this browser machine', 'InvalidAccessError')
+    this.#method = method.toUpperCase()
+    this.#url = new URL(url, current.href).href
+    this.readyState = 1
+    this.#fire('readystatechange')
+  }
+
+  /**
+   * Set a request header.
+   * @param name - the header.
+   * @param value - its value.
+   */
+  setRequestHeader(name: string, value: string): void {
+    this.#headers[name] = value
+  }
+
+  /** Every response header, folded as the interface specifies. */
+  getAllResponseHeaders(): string {
+    return Object.entries(this.#responseHeaders).map(([name, value]) => `${name}: ${value}`).join('\r\n')
+  }
+
+  /**
+   * One response header.
+   * @param name - the header.
+   * @returns its value, or null.
+   */
+  getResponseHeader(name: string): string | null {
+    return this.#responseHeaders[name.toLowerCase()] ?? null
+  }
+
+  /** Give up on the request. */
+  abort(): void {
+    this.#aborted = true
+    this.readyState = 0
+  }
+
+  /**
+   * Send it.
+   * @param body - the request body.
+   */
+  send(body?: Document | XMLHttpRequestBodyInit | null): void {
+    void (async () => {
+      try {
+        const reply = await ask('fetch', {
+          url: this.#url,
+          method: this.#method,
+          headers: this.#headers,
+          ...(body === undefined || body === null ? {} : { body: String(body) }),
+        }) as FetchReply
+        if (this.#aborted) return
+        if (reply.error !== undefined) throw new Error(reply.error)
+        this.status = reply.status
+        this.statusText = reply.statusText
+        this.responseURL = reply.url
+        this.#responseHeaders = reply.headers
+        this.#bytes = locate.fromBase64(reply.body)
+        this.responseText = new TextDecoder().decode(this.#bytes)
+        this.readyState = 4
+        this.#fire('readystatechange')
+        this.#fire('load')
+        this.#fire('loadend')
+      } catch {
+        if (this.#aborted) return
+        this.readyState = 4
+        this.#fire('readystatechange')
+        this.#fire('error')
+        this.#fire('loadend')
+      }
+    })()
+  }
+
+  /**
+   * Dispatch one event to both the listener list and the `on…` property.
+   * @param type - the event name.
+   */
+  #fire(type: string): void {
+    const event = new Event(type)
+    this.dispatchEvent(event)
+    const handler = (this as unknown as Record<string, unknown>)[`on${type}`]
+    if (typeof handler === 'function') (handler as (event: Event) => void).call(this, event)
+  }
+}
+define('XMLHttpRequest', ProxiedXhr)
+
+/**
+ * `sendBeacon`, which is fire-and-forget and therefore easy to honour.
+ * @param url - where to.
+ * @param data - what to send.
+ * @returns true, as the real one does when it accepts the request.
+ */
+try {
+  Object.defineProperty(Navigator.prototype, 'sendBeacon', {
+    configurable: true,
+    value: (url: string, data?: BodyInit): boolean => {
+      void ask('fetch', {
+        url: new URL(String(url), current.href).href,
+        method: 'POST',
+        headers: {},
+        ...(data === undefined ? {} : { body: String(data) }),
+      }).catch(() => undefined)
+      return true
+    },
+  })
+} catch {
+  // Not replaceable here; a beacon that does nothing is what it was already.
+}
+
+/**
+ * `WebSocket`, which this machine does not have.
+ *
+ * A socket needs a relay — the page can only speak HTTP — so the constructor
+ * succeeds and the socket closes, which is the shape every site already
+ * handles because it is what a blocked or failed connection looks like.
+ * Throwing from the constructor instead would take down the script that opened
+ * it, and a page that cannot open a chat socket should still render.
+ */
+class DeadSocket extends EventTarget {
+  static readonly CONNECTING = 0
+  static readonly OPEN = 1
+  static readonly CLOSING = 2
+  static readonly CLOSED = 3
+
+  readonly url: string
+  readyState = 0
+  onopen: ((event: Event) => unknown) | null = null
+  onclose: ((event: CloseEvent) => unknown) | null = null
+  onerror: ((event: Event) => unknown) | null = null
+  onmessage: ((event: MessageEvent) => unknown) | null = null
+
+  /**
+   * @param url - the socket URL, kept so the page reports it accurately.
+   */
+  constructor(url: string) {
+    super()
+    this.url = String(url)
+    send({ type: 'console', level: 'warn', text: `WebSocket to ${this.url} is not available on this machine` })
+    setTimeout(() => {
+      this.readyState = 3
+      const error = new Event('error')
+      this.dispatchEvent(error)
+      this.onerror?.(error)
+      const closed = new CloseEvent('close', { code: 1006, reason: 'no relay', wasClean: false })
+      this.dispatchEvent(closed)
+      this.onclose?.(closed)
+    }, 0)
+  }
+
+  /** Accepted and discarded; the socket is already closing. */
+  send(): void { /* nothing to send it down */ }
+
+  /** Already closed. */
+  close(): void { this.readyState = 3 }
+}
+define('WebSocket', DeadSocket)
+
+// ---------------------------------------------------------------------------
+// history, dialogs, and the rest of the window
+// ---------------------------------------------------------------------------
+
+/**
+ * A `History` the page keeps.
+ *
+ * `pushState` with a real URL throws `SecurityError` in an opaque origin —
+ * measured — so the whole interface is virtual: the state is held here, the
+ * URL is the virtual location's, and the page is told so its address bar and
+ * its back button agree with what the site thinks happened.
+ */
+const virtualHistory = {
+  get length(): number { return historyLength },
+  scrollRestoration: 'auto' as ScrollRestoration,
+  state: null as unknown,
+  /**
+   * Add a history entry without navigating.
+   * @param state - the state object.
+   * @param _title - ignored, as it is by every browser.
+   * @param url - the new URL.
+   */
+  pushState(state: unknown, _title: string, url?: string | null): void {
+    virtualHistory.state = state
+    if (url !== undefined && url !== null) current = new URL(String(url), current.href)
+    historyLength += 1
+    send({ type: 'history', action: 'push', url: current.href })
+  },
+  /**
+   * Replace the current entry.
+   * @param state - the state object.
+   * @param _title - ignored.
+   * @param url - the new URL.
+   */
+  replaceState(state: unknown, _title: string, url?: string | null): void {
+    virtualHistory.state = state
+    if (url !== undefined && url !== null) current = new URL(String(url), current.href)
+    send({ type: 'history', action: 'replace', url: current.href })
+  },
+  /** Go back one entry. */
+  back(): void { send({ type: 'history', action: 'go', delta: -1 }) },
+  /** Go forward one entry. */
+  forward(): void { send({ type: 'history', action: 'go', delta: 1 }) },
+  /**
+   * Go by a number of entries.
+   * @param delta - how far, negative for back.
+   */
+  go(delta = 0): void { send({ type: 'history', action: 'go', delta }) },
+}
+let historyLength = 1
+define('history', virtualHistory)
+
+/**
+ * How the next dialog is answered.
+ *
+ * A real `confirm()` blocks the page until someone clicks, and this one cannot:
+ * the answer has to be produced synchronously, inside the frame, while the
+ * thing that would decide it — a handler in the task realm — is two
+ * `postMessage` hops away. Measured before this was written: a sandboxed frame
+ * in this page is not cross-origin isolated, so there is no `SharedArrayBuffer`
+ * and no `Atomics.wait` to block on either.
+ *
+ * So the decision is made *before* the dialog rather than during it. Installing
+ * a handler arms this policy; the dialog is answered from it and recorded, and
+ * the handler still runs — asynchronously, with the message — so a task can see
+ * what was asked and check that it got the answer it wanted.
+ */
+let dialogPolicy: { action: 'accept' | 'dismiss', promptText?: string } = { action: 'dismiss' }
+
+/** Dialogs this document has raised, newest last, for the task that asked. */
+const dialogLog: { kind: string, message: string, answer: string, at: number }[] = []
+
+/**
+ * Answer one modal from the armed policy and record it.
+ * @param kind - which modal.
+ * @param message - what it asked.
+ * @param fallback - a prompt's default value.
+ * @returns what the page is told.
+ */
+function answerDialog(kind: string, message: string, fallback?: string): boolean | string | null {
+  const accept = dialogPolicy.action === 'accept'
+  const answer = kind === 'prompt'
+    ? (accept ? dialogPolicy.promptText ?? fallback ?? '' : null)
+    : (kind === 'confirm' ? accept : true)
+  dialogLog.push({ kind, message, answer: String(answer), at: Date.now() })
+  if (dialogLog.length > 100) dialogLog.splice(0, dialogLog.length - 100)
+  send({ type: 'dialog', kind, message, answer: String(answer), defaultValue: fallback ?? '' })
+  return answer as boolean | string | null
+}
+
+define('alert', (message?: unknown) => {
+  answerDialog('alert', String(message ?? ''))
+})
+define('confirm', (message?: unknown) => answerDialog('confirm', String(message ?? '')) === true)
+define('prompt', (message?: unknown, fallback?: unknown) => (
+  answerDialog('prompt', String(message ?? ''), fallback === undefined ? undefined : String(fallback))
+) as string | null)
+define('print', () => {
+  send({ type: 'dialog', kind: 'print', message: '', answer: 'dismissed' })
+})
+
+/**
+ * `window.open`, which opens a tab in this machine rather than in the browser
+ * around it.
+ * @param url - where to.
+ * @returns null, because a handle to a tab in another frame is not something
+ * this machine can give out.
+ */
+define('open', (url?: string): null => {
+  if (url !== undefined && url !== '') {
+    send({ type: 'open', url: new URL(String(url), current.href).href })
+  }
+  return null
+})
+
+try {
+  Object.defineProperty(Navigator.prototype, 'userAgent', { configurable: true, get: () => init.userAgent })
+} catch { /* left as the browser's own */ }
+
+for (const [name, getter] of [['URL', () => current.href], ['documentURI', () => current.href]] as const) {
+  try {
+    Object.defineProperty(Document.prototype, name, { configurable: true, get: getter })
+  } catch { /* left alone */ }
+}
+
+// ---------------------------------------------------------------------------
+// intercepting what would leave the frame
+// ---------------------------------------------------------------------------
+
+document.addEventListener('click', (event) => {
+  if (event.defaultPrevented || event.button !== 0) return
+  const target = event.target as Element | null
+
+  // A file input's click opens a picker this machine has no way to show. The
+  // page is told the click happened and the task is offered the chooser, which
+  // is the only path by which a file can reach a site from here.
+  const chooser = target?.closest?.('input[type=file]')
+  if (chooser !== null && chooser !== undefined) {
+    event.preventDefault()
+    send({
+      type: 'filechooser',
+      selector: fileChooserToken(chooser as HTMLInputElement),
+      multiple: (chooser as HTMLInputElement).multiple,
+      accept: (chooser as HTMLInputElement).accept,
+    })
+    return
+  }
+
+  const anchor = target?.closest?.('a[href]')
+  if (anchor === null || anchor === undefined) return
+  const href = anchor.getAttribute('href') ?? ''
+  if (href.startsWith('#') || href.startsWith('javascript:')) return
+  event.preventDefault()
+
+  // `download` means the link is a file rather than a page. Navigating to it
+  // would replace the tab with whatever the bytes render as; a download keeps
+  // the page where it is and hands the bytes to the task, which is what the
+  // attribute asks for and what a person clicking it would get.
+  if (anchor.hasAttribute('download')) {
+    send({
+      type: 'download',
+      url: new URL(href, current.href).href,
+      suggestedFilename: anchor.getAttribute('download') || '',
+    })
+    return
+  }
+  navigate(href, 'push')
+}, true)
+
+/**
+ * File inputs this document has offered, so a chooser can find one again.
+ *
+ * Weakly, so that an input the page has since replaced is collected with the
+ * rest of it: a strong map here would have pinned every file input this
+ * document ever surfaced for as long as the document lived, which is exactly
+ * what the reverse index existed to avoid.
+ */
+const fileChoosers = new Map<string, WeakRef<HTMLInputElement>>()
+
+/**
+ * The same pairing the other way round, so naming an input twice is a lookup
+ * rather than a scan of every input the document has ever surfaced.
+ */
+const chooserTokens = new WeakMap<HTMLInputElement, string>()
+
+let chooserCounter = 0
+
+/**
+ * Name one file input, so the answer to a chooser can be delivered to it.
+ * @param input - the input.
+ * @returns a token that survives until the document is replaced.
+ */
+function fileChooserToken(input: HTMLInputElement): string {
+  const held = chooserTokens.get(input)
+  if (held !== undefined) return held
+  const token = `fc${String(++chooserCounter)}`
+  fileChoosers.set(token, new WeakRef(input))
+  chooserTokens.set(input, token)
+  return token
+}
+
+document.addEventListener('submit', (event) => {
+  if (event.defaultPrevented) return
+  const form = event.target as HTMLFormElement | null
+  if (form === null) return
+  event.preventDefault()
+  const method = (form.getAttribute('method') ?? 'GET').toUpperCase()
+  const action = form.getAttribute('action') ?? current.href
+  const data = new FormData(form)
+  const fields: [string, string][] = []
+  data.forEach((value, key) => { fields.push([key, typeof value === 'string' ? value : value.name]) })
+  send({ type: 'submit', url: new URL(action, current.href).href, method, fields })
+}, true)
+
+// ---------------------------------------------------------------------------
+// what the agent sees: the console mode
+// ---------------------------------------------------------------------------
+
+/** Every console message and page error, newest last. */
+const consoleLog: { level: string, text: string, at: number }[] = []
+
+/** The most messages kept, so a page that logs in a loop cannot exhaust memory. */
+const CONSOLE_LIMIT = 500
+
+/**
+ * Render one console argument the way a devtools console would.
+ * @param value - the argument.
+ * @returns its text.
+ */
+function describe(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (value instanceof Error) return `${value.name}: ${value.message}`
+  if (value instanceof Element) return `<${value.tagName.toLowerCase()}>`
+  try {
+    return JSON.stringify(value, (_key, held: unknown) => (typeof held === 'bigint' ? String(held) : held)) ?? String(value)
+  } catch {
+    return String(value)
+  }
+}
+
+/**
+ * Record one line, and tell the page so the panel can show it live.
+ * @param level - the console level.
+ * @param text - the message.
+ */
+function record(level: string, text: string): void {
+  consoleLog.push({ level, text, at: Date.now() })
+  if (consoleLog.length > CONSOLE_LIMIT) consoleLog.splice(0, consoleLog.length - CONSOLE_LIMIT)
+  send({ type: 'console', level, text })
+}
+
+for (const level of ['log', 'info', 'warn', 'error', 'debug'] as const) {
+  const original = console[level].bind(console)
+  console[level] = (...args: unknown[]): void => {
+    record(level, args.map(describe).join(' '))
+    original(...args)
+  }
+}
+
+window.addEventListener('error', (event) => {
+  record('error', event.error instanceof Error
+    ? `${event.error.name}: ${event.error.message}`
+    : String(event.message))
+})
+window.addEventListener('unhandledrejection', (event) => {
+  record('error', `Unhandled rejection: ${describe((event as PromiseRejectionEvent).reason)}`)
+})
+
+// ---------------------------------------------------------------------------
+// what the agent sees: the DOM mode
+// ---------------------------------------------------------------------------
+
+/** Roles worth naming even when the element is not interactive. */
+const LANDMARKS = new Set(['main', 'nav', 'header', 'footer', 'aside', 'form', 'section', 'article', 'dialog'])
+
+/** Tags that are interactive without needing a role. */
+const INTERACTIVE = new Set(['a', 'button', 'input', 'select', 'textarea', 'summary', 'option', 'label'])
+
+/**
+ * Whether an element is visible enough to be worth telling the agent about.
+ *
+ * Not `offsetParent`: a `position: fixed` header has none and is very much on
+ * screen. This asks the two questions that actually matter — does it occupy
+ * space, and has something been done to hide it.
+ * @param element - the element.
+ * @returns whether it renders.
+ */
+function visible(element: Element): boolean {
+  // Whatever a walk counts as rendered, plus the two rules a snapshot adds:
+  // it is a list of what is *readable*, so a node hidden from assistive
+  // technology or faded fully out has nothing to say. Sharing the base answer
+  // with `frame-locate.ts` is the point — while there were two of these, an
+  // element could be absent from `browser_snapshot` and clicked by a task's
+  // `getByRole` in the same breath, which is the disagreement the shared
+  // `accessibleName` and ref registry exist to prevent.
+  //
+  // `isRendered`, not `isVisible`: this prunes the subtree, and a container
+  // that is flat in one direction — the `<div>` a dialog is portalled into, an
+  // uncleared float parent — is holding everything the model needs a ref for.
+  if (!locate.isRendered(element)) return false
+  if (getComputedStyle(element).opacity === '0') return false
+  return !locate.isAriaHidden(element)
+}
+
+/**
+ * The name a screen reader would give an element.
+ *
+ * The accessible-name computation lives in `src/browser/frame-locate.ts`,
+ * because `getByRole(role, {name})` has to agree with what a snapshot printed
+ * or the two halves of this machine describe different pages.
+ * @param element - the element.
+ * @returns its name, trimmed and capped.
+ */
+function accessibleName(element: Element): string {
+  return locate.accessibleName(element).slice(0, 200)
+}
+
+/**
+ * The role to report.
+ * @param element - the element.
+ * @returns the role name.
+ */
+function roleOf(element: Element): string {
+  return locate.ariaRole(element)
+}
+
+/** One node in the snapshot the agent reads. */
+interface SnapshotNode {
+  ref: string
+  role: string
+  name: string
+  tag: string
+  value?: string
+  href?: string
+  checked?: boolean
+  disabled?: boolean
+  rect: { x: number, y: number, width: number, height: number }
+  children: SnapshotNode[]
+}
+
+/**
+ * Walk the page the way a screen reader would, naming everything actionable.
+ *
+ * This is the DOM mode, and it is the one an agent should reach for first: it
+ * is exact where a screenshot is approximate, it is small where the HTML is
+ * enormous, and every node in it carries a `ref` that the click and type tools
+ * accept. A page of forty kilobytes of markup is usually a snapshot of a few
+ * dozen lines.
+ *
+ * Refs are handed out fresh on every snapshot and the map is cleared with
+ * them. That is deliberate: a ref that survived a re-render would point at an
+ * element the page has since replaced, and clicking it would do nothing while
+ * looking as though it had worked.
+ * @param options - whether to include every element or only the interactive ones.
+ * @returns the tree.
+ */
+function snapshot(options: { all?: boolean } = {}): SnapshotNode | null {
+  // The same registry the ARIA snapshot mints into. Two of them meant `e12`
+  // from one look and `e12` from the other were different elements, and a
+  // command given the wrong one acted on it without complaining.
+  locate.resetAriaRefs()
+  const wanted = (element: Element): boolean => {
+    const tag = element.tagName.toLowerCase()
+    if (INTERACTIVE.has(tag) || LANDMARKS.has(tag)) return true
+    if (element.hasAttribute('role') || element.hasAttribute('aria-label')) return true
+    if (/^h[1-6]$/.test(tag)) return true
+    if (tag === 'img' && element.hasAttribute('alt')) return true
+    if ((element as HTMLElement).isContentEditable) return true
+    if (element.hasAttribute('onclick') || element.getAttribute('tabindex') !== null) return true
+    return false
+  }
+
+  const build = (element: Element): SnapshotNode | null => {
+    if (!visible(element)) return null
+    const children: SnapshotNode[] = []
+    for (const child of element.children) {
+      const built = build(child)
+      if (built !== null) children.push(built)
+    }
+    const keep = options.all === true || wanted(element)
+    if (!keep) {
+      // A wrapper that holds one interesting thing should not add a level; a
+      // wrapper that holds several is the only place their grouping is
+      // recorded, so it stays.
+      if (children.length === 1) return children[0] ?? null
+      if (children.length === 0) {
+        const own = (element as HTMLElement).innerText?.trim() ?? ''
+        if (own === '' || element.children.length > 0) return null
+      } else return { ...blank(element), children }
+    }
+    const ref = locate.noteAriaRef(element)
+    const rect = element.getBoundingClientRect()
+    const node: SnapshotNode = {
+      ref,
+      role: roleOf(element),
+      name: accessibleName(element),
+      tag: element.tagName.toLowerCase(),
+      rect: {
+        x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height),
+      },
+      children,
+    }
+    if (element instanceof HTMLAnchorElement && element.href !== '') node.href = element.href
+    if (element instanceof HTMLInputElement) {
+      if (element.type === 'checkbox' || element.type === 'radio') node.checked = element.checked
+      else node.value = element.value.slice(0, 200)
+      if (element.disabled) node.disabled = true
+    }
+    if (element instanceof HTMLTextAreaElement) node.value = element.value.slice(0, 200)
+    if (element instanceof HTMLSelectElement) node.value = element.value
+    return node
+  }
+
+  const blank = (element: Element): SnapshotNode => {
+    const rect = element.getBoundingClientRect()
+    return {
+      ref: '',
+      role: 'group',
+      name: '',
+      tag: element.tagName.toLowerCase(),
+      rect: {
+        x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height),
+      },
+      children: [],
+    }
+  }
+
+  return build(document.body)
+}
+
+/**
+ * Find the element a command names, by ref or by selector.
+ * @param target - `{ ref }` or `{ selector }`.
+ * @returns the element.
+ */
+function resolve(target: { ref?: string, selector?: string }): Element {
+  if (target.ref !== undefined && target.ref !== '') {
+    // A ref carrying a frame name belongs to a document this one cannot reach.
+    if (/^f\d+e\d+$/.test(target.ref)) {
+      throw new Error(`${target.ref} names an element inside a nested frame, which the one-action tools cannot `
+        + 'reach: they act on the page itself. Use it from a task space — '
+        + `\`page.locator("aria-ref=${target.ref}")\` — which routes to the frame that handed it out.`)
+    }
+    const element = locate.ariaRefElement(target.ref)
+    if (element === undefined) {
+      throw new Error(`no element ${target.ref} — refs come from the most recent look at this page and are `
+        + 'replaced by the next one. Take a fresh snapshot.')
+    }
+    if (!element.isConnected) {
+      throw new Error(`${target.ref} is no longer in the page — it was replaced after the snapshot. Take a fresh one.`)
+    }
+    return element
+  }
+  if (target.selector !== undefined && target.selector !== '') {
+    const element = document.querySelector(target.selector)
+    if (element === null) throw new Error(`no element matches ${target.selector}`)
+    return element
+  }
+  throw new Error('expected a ref or a selector')
+}
+
+/**
+ * Click an element the way a person would.
+ *
+ * The full pointer sequence, not just `element.click()`: sites listen for
+ * `pointerdown` and `mousedown` at least as often as for `click`, and a menu
+ * that opens on `mousedown` never opens for a bare `click()`.
+ * @param element - what to click.
+ * @param options - which button, and how many times.
+ */
+function clickElement(element: Element, options: { button?: number, count?: number } = {}): void {
+  element.scrollIntoView({ block: 'center', inline: 'center' })
+  const rect = element.getBoundingClientRect()
+  const x = rect.x + rect.width / 2
+  const y = rect.y + rect.height / 2
+  const button = options.button ?? 0
+  const shared = {
+    bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, button, buttons: 1,
+  }
+  if (element instanceof HTMLElement) element.focus()
+  for (let index = 0; index < (options.count ?? 1); index += 1) {
+    element.dispatchEvent(new PointerEvent('pointerdown', { ...shared, pointerType: 'mouse', isPrimary: true }))
+    element.dispatchEvent(new MouseEvent('mousedown', shared))
+    element.dispatchEvent(new PointerEvent('pointerup', { ...shared, buttons: 0, pointerType: 'mouse', isPrimary: true }))
+    element.dispatchEvent(new MouseEvent('mouseup', { ...shared, buttons: 0 }))
+    element.dispatchEvent(new MouseEvent('click', { ...shared, buttons: 0, detail: index + 1 }))
+  }
+}
+
+/**
+ * Put text into a field, firing what a real typist fires.
+ *
+ * The value is set through the native setter rather than by assignment,
+ * because React and every framework that copies it install their own `value`
+ * property on the element — assigning to that one updates the DOM and leaves
+ * the framework's state untouched, which is the classic "the box shows my text
+ * and the form submits empty" failure.
+ * @param element - the field.
+ * @param text - what to type.
+ * @param options - whether to replace what is there.
+ */
+function typeInto(element: Element, text: string, options: { replace?: boolean } = {}): void {
+  if (element instanceof HTMLElement) element.focus()
+  if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+    const prototype = element instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype
+    const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set
+    const next = options.replace === false ? element.value + text : text
+    if (setter === undefined) element.value = next
+    else setter.call(element, next)
+    element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: text }))
+    element.dispatchEvent(new Event('change', { bubbles: true }))
+    return
+  }
+  if ((element as HTMLElement).isContentEditable) {
+    if (options.replace === false) (element as HTMLElement).innerText += text
+    else (element as HTMLElement).innerText = text
+    element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: text }))
+    return
+  }
+  throw new Error(`${element.tagName.toLowerCase()} is not a field that accepts typing`)
+}
+
+/**
+ * Press one key at whatever has focus.
+ * @param key - the key name, as `KeyboardEvent.key` spells it.
+ * @param modifiers - which modifiers are held.
+ */
+function pressKey(key: string, modifiers: string[] = []): void {
+  // Through open shadow roots, like the task space's own `keyboardAction`.
+  // `document.activeElement` names the component, not the field inside it, so
+  // `browser_key {key: 'Enter'}` dispatched at the host — where neither
+  // `typeInto` nor the submit-the-form branch below can apply, because the
+  // host is not an `<input>` — and still answered `{ok: true}`. The `code`
+  // table below was already shared for this reason; the target was not.
+  const target = locate.activeDeep()
+  const held = new Set(modifiers.map((name) => name.toLowerCase()))
+  const options: KeyboardEventInit = {
+    key,
+    // The table lives in `frame-locate.ts` with the rest of the shared
+    // element machinery. Two of them meant `browser_key` and a task space
+    // pressing the same key sent different `code`s — `Key1` against `Digit1`,
+    // and `Shift` in one and not the other.
+    code: locate.keyCodeFor(key),
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    ctrlKey: held.has('control') || held.has('ctrl'),
+    shiftKey: held.has('shift'),
+    altKey: held.has('alt'),
+    metaKey: held.has('meta') || held.has('cmd'),
+  }
+  const down = new KeyboardEvent('keydown', options)
+  target.dispatchEvent(down)
+  if (!down.defaultPrevented && key.length === 1
+    && (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) {
+    typeInto(target, key, { replace: false })
+  }
+  target.dispatchEvent(new KeyboardEvent('keyup', options))
+  // Enter in a field submits the form it is in, which is what a person
+  // pressing it expects and what no synthetic keydown does on its own.
+  if (key === 'Enter' && !down.defaultPrevented
+    && (target instanceof HTMLInputElement) && target.form !== null) {
+    target.form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// what the agent sees: the visual mode
+// ---------------------------------------------------------------------------
+
+/**
+ * Draw the page into a canvas and read the pixels back.
+ *
+ * The technique is the standard one — serialise the DOM into an SVG
+ * `foreignObject` and let the browser's own layout engine draw it — and it
+ * works here only because of a fact measured before any of this was written:
+ * a canvas in an opaque origin is tainted by a `blob:` URL and *not* by a
+ * `data:` URL. That is the entire reason `src/browser/net.ts` inlines
+ * subresources as `data:` URLs rather than the more obvious `blob:`. With
+ * `blob:`, `toDataURL` throws `SecurityError` on any page carrying an image.
+ *
+ * What it cannot draw: the contents of a `<canvas>` the page painted (copied
+ * where the browser allows it), a nested frame, a plugin, and anything a
+ * pseudo-element rule places. Scroll position is honoured by shifting the
+ * document under the viewport, which is what makes a screenshot show what is
+ * on screen rather than the top of the page.
+ * @param options - the region to take, in CSS pixels.
+ * @returns the PNG as a data URL, with the size it was drawn at.
+ */
+async function rasterise(
+  options: { fullPage?: boolean, clip?: { x: number, y: number, width: number, height: number } } = {},
+): Promise<{ dataUrl: string, width: number, height: number, scrollX: number, scrollY: number }> {
+  const full = options.fullPage === true
+  const clip = options.clip
+  // `bounded`, not a bare `Math.min`: a clip comes out of a task body, and one
+  // missing dimension made `Math.round(undefined)` `NaN`, which `Math.min` and
+  // `Math.max` both pass straight through to a canvas of no size.
+  const width = Math.round(bounded(clip?.width, full ? document.documentElement.scrollWidth : window.innerWidth, 1, 4096))
+  const height = Math.round(bounded(clip?.height, full ? document.documentElement.scrollHeight : window.innerHeight, 1, 8192))
+
+  const clone = document.documentElement.cloneNode(true) as HTMLElement
+  for (const script of [...clone.querySelectorAll('script,noscript')]) script.remove()
+
+  // Form state lives in properties, not attributes, so a clone of a filled-in
+  // form is an empty one unless the values are written across by hand.
+  const originals = [...document.querySelectorAll('input,textarea,select,canvas')]
+  const copies = [...clone.querySelectorAll('input,textarea,select,canvas')]
+  for (let index = 0; index < originals.length; index += 1) {
+    const from = originals[index]
+    const to = copies[index]
+    if (from === undefined || to === undefined) continue
+    if (from instanceof HTMLInputElement && to instanceof HTMLInputElement) {
+      to.setAttribute('value', from.value)
+      if (from.checked) to.setAttribute('checked', 'checked')
+    } else if (from instanceof HTMLTextAreaElement) to.textContent = from.value
+    else if (from instanceof HTMLSelectElement && to instanceof HTMLSelectElement) {
+      for (const option of [...to.querySelectorAll('option')]) {
+        if (option.getAttribute('value') === from.value) option.setAttribute('selected', 'selected')
+      }
+    } else if (from instanceof HTMLCanvasElement) {
+      // A canvas the page drew is pixels the serialiser cannot see. Copying it
+      // across as an image works whenever the page's own canvas is untainted,
+      // which is the common case here because every image is a `data:` URL.
+      try {
+        const image = document.createElement('img')
+        image.setAttribute('src', from.toDataURL())
+        image.setAttribute('width', String(from.width))
+        image.setAttribute('height', String(from.height))
+        to.replaceWith(image)
+      } catch {
+        // Tainted: leave the empty canvas rather than failing the screenshot.
+      }
+    }
+  }
+
+  if (clip !== undefined) {
+    // A clip is in page coordinates, and the clone is drawn from the document's
+    // own origin — so shifting it by the clip's offset is what puts the wanted
+    // region under the canvas. Bounded like the dimensions above, and for a
+    // worse reason: `-Math.round(undefined)` is the string `"NaNpx"`, which CSS
+    // drops without a word — so a clip missing an offset was answered with the
+    // top-left of the document, reported at the size that was asked for.
+    clone.style.marginLeft = `${String(-Math.round(bounded(clip.x, 0, 0, 1_000_000)))}px`
+    clone.style.marginTop = `${String(-Math.round(bounded(clip.y, 0, 0, 1_000_000)))}px`
+  } else if (!full) {
+    // Shift the document under a viewport-sized window, so what is drawn is
+    // what is on screen.
+    clone.style.marginLeft = `${String(-window.scrollX)}px`
+    clone.style.marginTop = `${String(-window.scrollY)}px`
+  }
+  clone.setAttribute('xmlns', 'http://www.w3.org/1999/xhtml')
+
+  const serialised = new XMLSerializer().serializeToString(clone)
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${String(width)}" height="${String(height)}">`
+    + `<foreignObject x="0" y="0" width="100%" height="100%">${serialised}</foreignObject></svg>`
+  const image = new Image()
+  image.width = width
+  image.height = height
+  await new Promise<void>((resolve, reject) => {
+    image.onload = () => { resolve() }
+    image.onerror = () => { reject(new Error('the page could not be drawn — its markup did not survive serialisation')) }
+    // `data:`, never `blob:`. See this function's note.
+    image.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
+  })
+
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const context = canvas.getContext('2d')
+  if (context === null) throw new Error('no 2d canvas context in this frame')
+  context.fillStyle = getComputedStyle(document.body).backgroundColor || '#ffffff'
+  context.fillRect(0, 0, width, height)
+  context.drawImage(image, 0, 0)
+  return {
+    dataUrl: canvas.toDataURL('image/png'),
+    width,
+    height,
+    scrollX: Math.round(window.scrollX),
+    scrollY: Math.round(window.scrollY),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// commands
+// ---------------------------------------------------------------------------
+
+/**
+ * Make a value from the page safe to send over the channel.
+ *
+ * `postMessage` uses structured clone, which throws on a function, a DOM node
+ * or anything holding one — and a thrown clone in the middle of a reply looks
+ * to the agent exactly like a hung tool. So everything is reduced to
+ * JSON-shaped data first, with depth and breadth capped.
+ * @param value - whatever the page produced.
+ * @param depth - how far down this call is.
+ * @returns something structured-cloneable.
+ */
+function portable(value: unknown, depth = 0): unknown {
+  if (value === null || typeof value === 'undefined') return null
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value
+  if (typeof value === 'bigint') return String(value)
+  if (typeof value === 'function') return `[Function ${value.name === '' ? 'anonymous' : value.name}]`
+  if (typeof value === 'symbol') return String(value)
+  if (value instanceof Error) return `${value.name}: ${value.message}`
+  if (value instanceof Element) {
+    return `<${value.tagName.toLowerCase()}${value.id === '' ? '' : ` id="${value.id}"`}>`
+  }
+  if (value instanceof Node) return `[${value.nodeName}]`
+  if (depth > 6) return '[deep]'
+  if (Array.isArray(value)) {
+    // The realm's copy of this caps at the same thousand and says so when it
+    // cuts; this one cut at a hundred and said nothing, so a
+    // `locator.evaluateAll` over five hundred rows arrived under the realm's
+    // own threshold and was reported as five hundred rows of which the
+    // hundredth was the last. A truncation nobody is told about is a wrong
+    // answer. See `portable` in `src/browser/realm.ts`.
+    const kept = value.slice(0, 1000).map((entry) => portable(entry, depth + 1))
+    if (value.length > kept.length) {
+      kept.push(`[… ${String(value.length - kept.length)} more entries were dropped here. Return an aggregate, `
+        + 'or write the whole list with saveFile(path, rows).]')
+    }
+    return kept
+  }
+  if (value instanceof Date) return value.toISOString()
+  // Prototype-less, because the keys come off a value the page supplied:
+  // `entries['__proto__'] = …` on a plain object runs the inherited setter and
+  // re-parents the accumulator instead of adding a field, so a `__proto__` key
+  // vanished from the answer with no truncation notice.
+  const entries: Record<string, unknown> = Object.create(null) as Record<string, unknown>
+  let count = 0
+  for (const key of Object.keys(value as Record<string, unknown>)) {
+    if (count++ > 200) break
+    try {
+      entries[key] = portable((value as Record<string, unknown>)[key], depth + 1)
+    } catch {
+      entries[key] = '[unreadable]'
+    }
+  }
+  return entries
+}
+
+/** How long a `waitFor` may wait before it reports that nothing happened. */
+const DEFAULT_WAIT_MS = 10_000
+
+/**
+ * Run one command from the page and produce its result.
+ * @param kind - which command.
+ * @param payload - its arguments.
+ * @returns the result, which must be structured-cloneable.
+ */
+async function command(kind: string, payload: Record<string, unknown>): Promise<unknown> {
+  switch (kind) {
+    case 'snapshot':
+      return {
+        url: current.href,
+        title: document.title,
+        tree: snapshot({ all: payload.all === true }),
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        scroll: { x: Math.round(window.scrollX), y: Math.round(window.scrollY) },
+        size: { width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight },
+      }
+    case 'text': {
+      const root = payload.selector === undefined || payload.selector === ''
+        ? document.body
+        : document.querySelector(String(payload.selector))
+      if (root === null) throw new Error(`no element matches ${String(payload.selector)}`)
+      return { text: (root as HTMLElement).innerText ?? root.textContent ?? '', url: current.href, title: document.title }
+    }
+    case 'html': {
+      const root = payload.selector === undefined || payload.selector === ''
+        ? document.documentElement
+        : document.querySelector(String(payload.selector))
+      if (root === null) throw new Error(`no element matches ${String(payload.selector)}`)
+      return { html: root.outerHTML }
+    }
+    case 'click':
+      clickElement(resolve(payload as { ref?: string, selector?: string }), {
+        ...(typeof payload.button === 'number' ? { button: payload.button } : {}),
+        ...(typeof payload.count === 'number' ? { count: payload.count } : {}),
+      })
+      return { ok: true }
+    case 'clickAt': {
+      const x = Number(payload.x)
+      const y = Number(payload.y)
+      const element = document.elementFromPoint(x, y)
+      if (element === null) throw new Error(`nothing is at (${String(x)}, ${String(y)}) in the viewport`)
+      clickElement(element)
+      return { ok: true, tag: element.tagName.toLowerCase(), name: accessibleName(element) }
+    }
+    case 'type':
+      typeInto(resolve(payload as { ref?: string, selector?: string }), String(payload.text ?? ''), {
+        replace: payload.replace !== false,
+      })
+      if (payload.enter === true) pressKey('Enter')
+      return { ok: true }
+    case 'select': {
+      const element = resolve(payload as { ref?: string, selector?: string })
+      if (!(element instanceof HTMLSelectElement)) throw new Error('that element is not a <select>')
+      const wanted = String(payload.value ?? '')
+      const option = [...element.options].find((entry) => entry.value === wanted || entry.text === wanted)
+      if (option === undefined) {
+        throw new Error(`no option "${wanted}"; it has ${[...element.options].map((entry) => entry.value).join(', ')}`)
+      }
+      element.value = option.value
+      element.dispatchEvent(new Event('input', { bubbles: true }))
+      element.dispatchEvent(new Event('change', { bubbles: true }))
+      return { ok: true, value: option.value }
+    }
+    case 'key':
+      pressKey(String(payload.key ?? ''), (payload.modifiers as string[] | undefined) ?? [])
+      return { ok: true }
+    case 'scroll': {
+      if (payload.ref !== undefined || payload.selector !== undefined) {
+        resolve(payload as { ref?: string, selector?: string }).scrollIntoView({ block: 'center' })
+      } else window.scrollTo({ left: Number(payload.x ?? window.scrollX), top: Number(payload.y ?? window.scrollY) })
+      await new Promise((resolve_) => setTimeout(resolve_, 50))
+      return { x: Math.round(window.scrollX), y: Math.round(window.scrollY) }
+    }
+    case 'evaluate': {
+      const source = String(payload.source ?? '')
+      // Indirect eval, so the expression sees the page's globals rather than
+      // this bundle's locals — the console mode is supposed to be the page's
+      // console, not a window onto the shim layer.
+      const result: unknown = await (0, eval)(`(async () => { ${/\breturn\b/.test(source) ? source : `return (${source})`} })()`)
+      return { value: portable(result) }
+    }
+    case 'screenshot':
+      return rasterise({
+        fullPage: payload.fullPage === true,
+        ...(payload.clip === undefined ? {} : { clip: payload.clip as { x: number, y: number, width: number, height: number } }),
+      })
+    case 'console': {
+      // Bounded rather than negated, for the reason `dialogs` below gives:
+      // `slice(-0)` is `slice(0)` and so is `slice(NaN)`, so asking for none —
+      // or mistyping the number — returned every line the page had ever logged.
+      const limit = bounded(payload.limit, 100, 0, consoleLog.length)
+      return { entries: limit === 0 ? [] : consoleLog.slice(-limit) }
+    }
+    case 'cookies':
+      return { cookie: cookieText }
+    case 'storage': {
+      const area = payload.area === 'session' ? window.sessionStorage : window.localStorage
+      const entries: Record<string, string> = {}
+      for (let index = 0; index < area.length; index += 1) {
+        const key = area.key(index)
+        if (key !== null) entries[key] = area.getItem(key) ?? ''
+      }
+      return { entries }
+    }
+    case 'waitFor': {
+      // `bounded`, not `Number`: a deadline of `Date.now() + NaN` is `NaN`, and
+      // `Date.now() > NaN` is false for ever — so one mistyped `timeoutMs` left
+      // this loop polling the document until it was replaced, long after the
+      // machine had given up on the answer. Every wait below reads it the same
+      // way.
+      const waitMs = bounded(payload.timeoutMs, DEFAULT_WAIT_MS, 0, 600_000)
+      const deadline = Date.now() + waitMs
+      const selector = payload.selector === undefined ? undefined : String(payload.selector)
+      const text = payload.text === undefined ? undefined : String(payload.text)
+      for (;;) {
+        if (selector !== undefined) {
+          const found = document.querySelector(selector)
+          if (found !== null && visible(found)) return { found: true, waitedMs: 0 }
+        }
+        if (text !== undefined && (document.body.innerText ?? '').includes(text)) return { found: true, waitedMs: 0 }
+        if (selector === undefined && text === undefined) {
+          // No condition: settle for the document being ready and quiet.
+          if (document.readyState === 'complete') return { found: true, waitedMs: 0 }
+        }
+        if (Date.now() > deadline) {
+          return {
+            found: false,
+            waitedMs: waitMs,
+            title: document.title,
+            url: current.href,
+          }
+        }
+        await new Promise((resolve_) => setTimeout(resolve_, 100))
+      }
+    }
+
+    // ── what a task space drives the page with ─────────────────────────────
+    //
+    // Everything below takes a locator *chain* rather than a ref: a chain is
+    // re-resolved against the live DOM on every call, so a page that
+    // re-rendered between two of them is simply matched again. See
+    // `src/browser/frame-locate.ts`.
+
+    case 'locator.act':
+      return locate.performAction(
+        payload.chain as locate.LocatorStep[],
+        String(payload.action ?? ''),
+        (payload.args as Record<string, unknown> | undefined) ?? {},
+        {
+          ...(payload.timeoutMs === undefined
+            ? {}
+            : { timeoutMs: bounded(payload.timeoutMs, DEFAULT_WAIT_MS, 0, 600_000) }),
+          force: payload.force === true,
+        },
+      )
+    case 'locator.query':
+      return {
+        value: portable(locate.performQuery(
+          payload.chain as locate.LocatorStep[],
+          String(payload.query ?? ''),
+          (payload.args as Record<string, unknown> | undefined) ?? {},
+        )),
+      }
+    case 'locator.wait':
+      return locate.waitForState(
+        payload.chain as locate.LocatorStep[],
+        (payload.state ?? 'visible') as locate.LocatorState,
+        bounded(payload.timeoutMs, DEFAULT_WAIT_MS, 0, 600_000),
+      )
+    case 'locator.evaluate': {
+      const element = locate.locateOne(payload.chain as locate.LocatorStep[])
+      const call = (0, eval)(`(${String(payload.source ?? '')})`) as (node: Element, argument: unknown) => unknown
+      return { value: portable(await call(element, payload.argument)) }
+    }
+    case 'locator.evaluateAll': {
+      const elements = locate.locateAll(payload.chain as locate.LocatorStep[])
+      const call = (0, eval)(`(${String(payload.source ?? '')})`) as (nodes: Element[], argument: unknown) => unknown
+      return { value: portable(await call(elements, payload.argument)) }
+    }
+    case 'locator.actionability': {
+      const found = locate.locateAll(payload.chain as locate.LocatorStep[])
+      return locate.checkActionability(found[0])
+    }
+    case 'locator.box': {
+      const element = locate.locateOne(payload.chain as locate.LocatorStep[])
+      const rect = element.getBoundingClientRect()
+      return {
+        x: rect.x + window.scrollX, y: rect.y + window.scrollY, width: rect.width, height: rect.height,
+        viewport: { x: rect.x, y: rect.y },
+      }
+    }
+    case 'aria.snapshot': {
+      // A chain means the caller asked for the tree under one element, which
+      // is what `locator.ariaSnapshot()` is for. Without honouring it the
+      // answer was the whole document — and the whole document's refs, which
+      // replaced the ones the caller was holding.
+      const chain = payload.chain as locate.LocatorStep[] | undefined
+      const scoped = chain === undefined || chain.length === 0 ? undefined : locate.locateOne(chain)
+      return locate.ariaSnapshot({
+        ...(scoped === undefined ? {} : { root: scoped }),
+        ...(payload.depth === undefined ? {} : { depth: Number(payload.depth) }),
+        ...(payload.maxChars === undefined ? {} : { maxChars: Number(payload.maxChars) }),
+        boxes: payload.boxes === true,
+      })
+    }
+    case 'observe': {
+      const observation = locate.observe({
+        ...(payload.depth === undefined ? {} : { depth: Number(payload.depth) }),
+        ...(payload.maxChars === undefined ? {} : { maxChars: Number(payload.maxChars) }),
+        focus: payload.focus !== false,
+        frames: (payload.frames ?? 'visible') as 'none' | 'visible' | 'all',
+        boxes: payload.boxes === true,
+      })
+      // The document's real URL is the one the machine gave it, not the
+      // `about:srcdoc` the frame itself reports.
+      return { ...observation, url: current.href, dialogs: dialogLog.slice(-5) }
+    }
+    case 'focus.info':
+      return locate.focusInfo()
+    case 'hit.test':
+      return locate.hitTest(payload as { x?: number, y?: number, chain?: locate.LocatorStep[] })
+    case 'paste':
+      return locate.pasteText(String(payload.text ?? ''), {
+        ...(payload.format === undefined ? {} : { format: payload.format as 'text' | 'tsv' }),
+        requireEditableFocus: payload.requireEditableFocus === true,
+      })
+    case 'mouse':
+      return locate.mouseAction(String(payload.action ?? 'move'), payload)
+    case 'keyboard':
+      return locate.keyboardAction(String(payload.action ?? 'press'), payload)
+    case 'evaluateFn': {
+      const call = (0, eval)(`(${String(payload.source ?? '')})`) as (argument: unknown) => unknown
+      return { value: portable(await call(payload.argument)) }
+    }
+    case 'waitForFunction':
+      return {
+        value: portable(await locate.waitForFunction(
+          String(payload.source ?? ''),
+          payload.argument,
+          bounded(payload.timeoutMs, DEFAULT_WAIT_MS, 0, 600_000),
+          bounded(payload.pollMs, 100, 10, 60_000),
+        )),
+      }
+    case 'frame.load': {
+      // The frame element is in *this* document, which is the only document
+      // allowed to set its `srcdoc`: the machine cannot reach it, and neither
+      // can the frame itself.
+      const element = document.querySelector(`iframe[data-wb-frame="${String(payload.token ?? '')}"],`
+        + `frame[data-wb-frame="${String(payload.token ?? '')}"]`)
+      if (element === null) throw new Error(`no frame ${String(payload.token ?? '')} in this document`)
+      element.setAttribute('srcdoc', String(payload.html ?? ''))
+      return { ok: true }
+    }
+    case 'frames.list':
+      return { frames: locate.frameDescriptors(), url: current.href }
+    case 'frame.resolve': {
+      const element = locate.locateOne(payload.chain as locate.LocatorStep[])
+      if (!(element instanceof HTMLIFrameElement) && element.tagName.toLowerCase() !== 'frame') {
+        throw new Error(`frameLocator() names <${element.tagName.toLowerCase()}>, which is not a frame`)
+      }
+      const token = element.getAttribute('data-wb-frame')
+      if (token === null || token === '') {
+        throw new Error('that frame has no runtime in it: it was not one this machine fetched, so there is '
+          + 'nothing inside it to drive. Frames are followed to a depth, and one whose source could not be '
+          + 'loaded stays empty.')
+      }
+      return { token, box: element.getBoundingClientRect().toJSON() as unknown }
+    }
+    case 'files.set': {
+      const token = String(payload.chooser ?? '')
+      const input = fileChoosers.get(token)?.deref()
+      if (input === undefined) throw new Error(`no file chooser ${token} in this document`)
+      return { ok: true, files: locate.setFiles(input, (payload.files ?? []) as locate.WireFile[]) }
+    }
+    case 'dialog.arm': {
+      dialogPolicy = {
+        action: payload.action === 'accept' ? 'accept' : 'dismiss',
+        ...(payload.promptText === undefined ? {} : { promptText: String(payload.promptText) }),
+      }
+      return { armed: dialogPolicy.action }
+    }
+    case 'dialogs': {
+      // Bounded rather than negated: `slice(-0)` is `slice(0)` and so is
+      // `slice(NaN)`, so asking for none — or mistyping the number — returned
+      // every dialog the page had ever raised.
+      const limit = bounded(payload.limit, 20, 0, dialogLog.length)
+      return { dialogs: limit === 0 ? [] : dialogLog.slice(-limit) }
+    }
+    case 'testId':
+      locate.setTestIdAttribute(String(payload.attribute ?? 'data-testid'))
+      return { ok: true }
+
+    default:
+      throw new Error(`unknown command ${kind}`)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// the channel
+// ---------------------------------------------------------------------------
+
+window.addEventListener('message', (event: MessageEvent) => {
+  const message = event.data as Record<string, unknown> | undefined
+  if (message === undefined || message.wb !== true || message.nonce !== init.nonce) return
+  // Only the machine drives this document. The nonce is not a secret from the
+  // page holding this frame — it reads it out of the `srcdoc` attribute in its
+  // own DOM — so without this a browsed page could run `evaluate` inside a
+  // frame of another origin, and forge the replies this document's `fetch`
+  // shim is waiting on.
+  if (event.source !== machineWindow()) return
+
+  if (message.type === 'reply') {
+    const waiting = pending.get(String(message.id))
+    if (waiting === undefined) return
+    pending.delete(String(message.id))
+    if (message.error === undefined) waiting.resolve(message.value)
+    else waiting.reject(new Error(String(message.error)))
+    return
+  }
+
+  if (message.type === 'command') {
+    const id = String(message.id)
+    void (async () => {
+      try {
+        const value = await command(String(message.kind), (message.payload as Record<string, unknown> | undefined) ?? {})
+        send({ type: 'result', id, value })
+      } catch (error) {
+        send({ type: 'result', id, error: error instanceof Error ? error.message : String(error) })
+      }
+    })()
+    return
+  }
+
+  if (message.type === 'cookieUpdate') {
+    cookieText = String(message.value)
+  }
+})
+
+// Anything queued before the channel existed, and then the announcement that
+// this frame is live. The page waits for this before it runs a command: a
+// command sent to a frame whose bundle has not evaluated is one that vanishes.
+for (const queued of outbox.splice(0)) {
+  try {
+    machineWindow().postMessage(queued, '*')
+  } catch { /* the page has gone */ }
+}
+
+const announce = (): void => {
+  send({
+    type: 'ready',
+    url: current.href,
+    title: document.title,
+    readyState: document.readyState,
+  })
+}
+announce()
+if (document.readyState !== 'complete') window.addEventListener('load', announce)
+document.addEventListener('DOMContentLoaded', announce)
+
+// A page that changes its title after loading should change the tab's.
+new MutationObserver(() => { send({ type: 'title', title: document.title }) })
+  .observe(document.head === null ? document.documentElement : document.head, { subtree: true, childList: true })
+
+export {}
